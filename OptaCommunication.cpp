@@ -21,17 +21,22 @@ const uint16_t PC_PORT    = 5005;               // destination UDP port on PC (f
 const uint16_t LOCAL_PORT = 5006;               // Opta local UDP port
 EthernetUDP Udp;
 
+const char* DEVICE_ID = "optaA";
+static uint32_t seq = 0;
+
 void setup() {
-  // Keep serial for status messages (no data streaming here)
   Serial.begin(115200);
   while (!Serial) {;}
 
-  // Ethernet: DHCP with static fallback
-  if (Ethernet.begin(mac) == 0) {
-    IPAddress ip(1,1,1,1), dns(1,1,1,1), gw(1,1,1,1), mask(255,255,255,0);
+  if (Ethernet.localIP()==IPAddress(0,0,0,0)) {
+    IPAddress ip(192,168,130,55), gw(192,168,130,1), mask(255,255,255,0), dns(192,168,130,1);
     Ethernet.begin(mac, ip, dns, gw, mask);
   }
-  delay(500);
+
+  Serial.print("IP: ");      Serial.println(Ethernet.localIP());
+  Serial.print("Gateway: "); Serial.println(Ethernet.gatewayIP());
+
+  delay(200);
   Udp.begin(LOCAL_PORT);
 
   // BLE init
@@ -51,99 +56,85 @@ void loop() {
   while (millis() - scanStart < 5000) { // 5s scan window
     BLEDevice d = BLE.available();
     if (d) {
-      // Optional: you could also filter by name "NICLA"
       peripheral = d;
       Serial.print("Device found: "); Serial.println(peripheral.address());
       Serial.print("Name: ");         Serial.println(peripheral.localName());
       break;
     }
-    delay(10);
+    BLE.poll();
+    delay(5);
   }
   BLE.stopScan();
 
-  if (!peripheral) {
-    // Nothing found this pass; try again
-    delay(300);
-    return;
-  }
+  if (!peripheral) { delay(200); return; }
 
   // 2) Connect
-  if (!peripheral.connect()) {
-    Serial.println("Failed to connect to peripheral device!");
-    delay(300);
-    return;
-  }
+  if (!peripheral.connect()) { Serial.println("Failed to connect"); delay(200); return; }
   Serial.println("Connected to peripheral device!");
 
   // 3) Discover attributes
   Serial.println("Discovering peripheral device attributes...");
   if (!peripheral.discoverAttributes()) {
-    Serial.println("Failed to discover peripheral attributes!");
+    Serial.println("Failed to discover attributes");
     peripheral.disconnect();
-    delay(300);
+    delay(200);
     return;
   }
   Serial.println("Peripheral device attributes discovered!");
 
   // 4) Locate service/characteristic and subscribe
-  BLEService         niclaService        = peripheral.service(serviceUuid);
-  BLECharacteristic  sensorCharacteristic = peripheral.characteristic(characteristicUuid);
+  BLECharacteristic sensorCharacteristic = peripheral.characteristic(characteristicUuid);
 
-  if (!sensorCharacteristic) {
-    Serial.println("Characteristic not found!");
-    peripheral.disconnect();
-    delay(300);
-    return;
-  }
-  if (!sensorCharacteristic.canSubscribe()) {
-    Serial.println("Characteristic not subscribable!");
-    peripheral.disconnect();
-    delay(300);
-    return;
-  }
-  if (!sensorCharacteristic.subscribe()) {
-    Serial.println("Subscription failed!");
-    peripheral.disconnect();
-    delay(300);
-    return;
-  }
+  if (!sensorCharacteristic)            { Serial.println("Characteristic not found!"); peripheral.disconnect(); delay(200); return; }
+  if (!sensorCharacteristic.canSubscribe()) { Serial.println("Characteristic not subscribable!"); peripheral.disconnect(); delay(200); return; }
+  if (!sensorCharacteristic.subscribe())    { Serial.println("Subscription failed!"); peripheral.disconnect(); delay(200); return; }
   Serial.println("Subscribed to accelerometer/environment characteristic.");
 
   // 5) Receive notifications and forward via UDP
-  //    Only send once we get a valid 14-byte payload.
+  //    Drain any backlog and send only the latest sample to avoid long lags.
   while (peripheral.connected()) {
-    if (sensorCharacteristic.valueUpdated()) {
-      uint8_t data[bufferSize];
+    BLE.poll();  // keep BLE events flowing
+
+    uint8_t data[bufferSize];
+    bool got = false;
+
+    // Drain queue: keep the most recent full payload
+    while (sensorCharacteristic.valueUpdated()) {
       int bytes = sensorCharacteristic.readValue(data, sizeof(data));
-      if (bytes == bufferSize) {
-        // Parse little-endian int16_t values
-        int16_t accX, accY, accZ, temp_x100, hum_x100, bvoc_x100, iaq_x10;
-        memcpy(&accX,      data + 0, 2);
-        memcpy(&accY,      data + 2, 2);
-        memcpy(&accZ,      data + 4, 2);
-        memcpy(&temp_x100, data + 6, 2);
-        memcpy(&hum_x100,  data + 8, 2);
-        memcpy(&bvoc_x100, data +10, 2);
-        memcpy(&iaq_x10,   data +12, 2);
-
-        // CSV payload: X,Y,Z,temp_x100,hum_x100,bvoc_x100,iaq_x10\n
-        char payload[96];
-        int n = snprintf(payload, sizeof(payload), "%d,%d,%d,%d,%d,%d,%d\n",
-                         accX, accY, accZ, temp_x100, hum_x100, bvoc_x100, iaq_x10);
-
-        if (n > 0) {
-          Udp.beginPacket(PC_IP, PC_PORT);
-          Udp.write((const uint8_t*)payload, (size_t)n);
-          Udp.endPacket();
-          Serial.println("pakete enviado");
-        }
-      }
-      // If bytes != 14, ignore and wait for the next valid notification
+      if (bytes == bufferSize) got = true;
+      BLE.poll();
     }
-    delay(1);
+
+    if (got) {
+      // Parse little-endian int16_t values
+      int16_t accX, accY, accZ, temp_x100, hum_x100, bvoc_x100, iaq_x10;
+      memcpy(&accX,      data + 0, 2);
+      memcpy(&accY,      data + 2, 2);
+      memcpy(&accZ,      data + 4, 2);
+      memcpy(&temp_x100, data + 6, 2);
+      memcpy(&hum_x100,  data + 8, 2);
+      memcpy(&bvoc_x100, data +10, 2);
+      memcpy(&iaq_x10,   data +12, 2);
+
+      unsigned long ts_ms = millis();  // Opta timestamp
+
+      // CSV: device,seq,ts_ms,accX,accY,accZ,temp_x100,hum_x100,bvoc_x100,iaq_x10
+      char payload[140];
+      int n = snprintf(payload, sizeof(payload),
+                       "%s,%lu,%lu,%d,%d,%d,%d,%d,%d,%d\n",
+                       DEVICE_ID, (unsigned long)seq++, ts_ms,
+                       accX, accY, accZ, temp_x100, hum_x100, bvoc_x100, iaq_x10);
+
+      if (n > 0) {
+        Udp.beginPacket(PC_IP, PC_PORT);
+        Udp.write((const uint8_t*)payload, (size_t)n);
+        Udp.endPacket();
+      }
+    }
+    // no artificial delay; BLE.poll() already yields
   }
 
   Serial.println("Connection lost.");
   peripheral.disconnect();
-  delay(300);
+  delay(200);
 }
