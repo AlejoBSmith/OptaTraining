@@ -28,7 +28,7 @@ static bool debug_nn = false;  // set true for verbose EI debug
 float buffer[EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE] = { 0 };
 
 // threshold from original code
-#define ANOMALY_TH 1500
+#define ANOMALY_TH 200
 
 // Local state
 float anomaly_score = 0.0f;
