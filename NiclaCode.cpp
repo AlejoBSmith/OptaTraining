@@ -1,124 +1,180 @@
-/**
-  Machine Learning for Motor Anomaly Detection with Nicla Sense ME & Opta
-  Sends corrected acceleration, temperature, humidity, bVOC, and IAQ via BLE.
-  Correction: Temperature +5°C, Humidity +20%
-*/
-
-#include <ArduinoBLE.h>
-#include "Arduino_BHY2.h"
+#include <Arduino.h>
+#include <Arduino_BHY2.h>
 #include "sensors/SensorBSEC.h"
+#include <OptaMotorDCTraining_inferencing.h>
+#include <ArduinoBLE.h>   // BLE
 
-// BLE data: 3x acc + temp + hum + bVOC + IAQ (all int16_t) = 14 bytes
-#define bufferSize 14
+// Identificador
+const char* DEVICE_ID = "Nicla_BH1";
 
-// BLE UUIDs (should match those in Opta code)
-const char* deviceServiceUuid = "19b10000-e8f2-537e-4f6c-d104768a1214";
-const char* deviceServiceCharacteristicUuid = "19b10001-e8f2-537e-4f6c-d104768a1214";
+// UUIDs (deben coincidir con el Opta)
+const char* serviceUuid        = "19b10000-e8f2-537e-4f6c-d104768a1214";
+const char* characteristicUuid = "19b10001-e8f2-537e-4f6c-d104768a1214";
 
-// Sensor objects
+// BLE Service & Characteristic
+BLEService niclaService(serviceUuid);
+BLECharacteristic sensorCharacteristic(characteristicUuid, BLERead | BLENotify, 32);
+
+// Sensores
 SensorXYZ accel(SENSOR_ID_ACC);
 SensorBSEC bsec(SENSOR_ID_BSEC);
 
-// Correction offsets
-const float temp_correction = -3.0;     // Sensor reads +5°C high, so subtract 5
-const float humidity_correction = 20.0; // Sensor reads -20%, so add 20
+// Correcciones
+const float temp_correction = 0;
+const float humidity_correction = 0;
 
-// BLE Service and Characteristic
-BLEService niclaService(deviceServiceUuid);
-BLECharacteristic sensorCharacteristic(deviceServiceCharacteristicUuid, BLERead | BLENotify, bufferSize);
+// Buffer para inferencia
+float buffer[EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE] = { 0 };
 
-// Transmission interval
-const long interval = 100; // ms (10 Hz)
+// Control de tiempo
+unsigned long lastSample = 0;
+const unsigned long sampleInterval = 100; // 10 Hz
+unsigned long sampleTime_ms = 0;
+
+// --- Paquete compacto ---
+struct Packet {
+  uint32_t sampleTime; 
+  int16_t accXRMS;
+  int16_t accYRMS;
+  int16_t accZRMS;
+  int16_t temp;
+  int16_t hum;
+  int16_t bvoc;
+  int16_t iaq;
+  int32_t anomaly;
+};
 
 void setup() {
   Serial.begin(115200);
-  delay(2000);
+  while (!Serial);
 
-  // Init sensors
-  if (!BHY2.begin()) {
-    Serial.println("Failed to initialize BHY2!");
+  if (!BHY2.begin(NICLA_STANDALONE)) {
+    Serial.println("Failed to init BHY2!");
     while (1);
   }
   if (!accel.begin()) {
-    Serial.println("Failed to initialize accelerometer!");
+    Serial.println("Failed to init accelerometer!");
     while (1);
   }
   if (!bsec.begin()) {
-    Serial.println("Failed to initialize BSEC sensor!");
+    Serial.println("Failed to init BSEC!");
     while (1);
   }
 
-  // Init BLE
+  // --- Init BLE ---
   if (!BLE.begin()) {
-    Serial.println("Failed to start Bluetooth!");
+    Serial.println("Failed to start BLE!");
     while (1);
   }
   BLE.setDeviceName("NICLA");
+  BLE.setLocalName("NICLA");
   BLE.setAdvertisedService(niclaService);
   niclaService.addCharacteristic(sensorCharacteristic);
   BLE.addService(niclaService);
   BLE.advertise();
 
-  Serial.println("Bluetooth initialized and waiting for a connection...");
+  Serial.println("BLE initialized, advertising started");
 }
 
 void loop() {
+  // Esperar a que un central se conecte
   BLEDevice central = BLE.central();
-  Serial.println("Searching for central device...");
-
   if (central) {
-    Serial.print("Connected to: ");
+    Serial.print("Connected to central: ");
     Serial.println(central.address());
 
+    // Mientras el Opta siga conectado
     while (central.connected()) {
-      static unsigned long lastUpdateTime = millis();
-      BHY2.update();
+      int samples = 0;
 
-      if (millis() - lastUpdateTime >= interval) {
-        lastUpdateTime = millis();
+      // --- Recolectar ventana de datos ---
+      while (samples < EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE) {
+        BHY2.update();
 
-        // --- Get sensor data ---
-        int16_t accX = accel.x();
-        int16_t accY = accel.y();
-        int16_t accZ = accel.z();
+        if (accel.dataAvailable()) {
+          unsigned long now = millis();
+          if (now - lastSample >= sampleInterval) {
+            sampleTime_ms = now - lastSample;
+            lastSample = now;
 
-        // Apply corrections here
-        float temperature = bsec.comp_t() + temp_correction;       // Compensated, then corrected
-        float humidity    = bsec.comp_h() + humidity_correction;   // Compensated, then corrected
-        float bvoc        = bsec.b_voc_eq();  // ppm
-        float iaq         = bsec.iaq();       // 0-500
+            buffer[samples + 0] = accel.x();
+            buffer[samples + 1] = accel.y();
+            buffer[samples + 2] = accel.z();
 
-        // Convert to int16 for BLE
-        int16_t temp_int = (int16_t)(temperature * 100); // °C x100
-        int16_t hum_int  = (int16_t)(humidity * 100);    // % x100
-        int16_t bvoc_int = (int16_t)(bvoc * 100);        // ppm x100
-        int16_t iaq_int  = (int16_t)(iaq * 10);          // index x10
-
-        // Debug output (shows *corrected* values)
-        Serial.print("Accel: ");
-        Serial.print(accX); Serial.print(", ");
-        Serial.print(accY); Serial.print(", ");
-        Serial.print(accZ); Serial.print(" | Temp: ");
-        Serial.print(temperature); Serial.print(" C | Hum: ");
-        Serial.print(humidity); Serial.print(" % | bVOC: ");
-        Serial.print(bvoc); Serial.print(" ppm | IAQ: ");
-        Serial.println(iaq);
-
-        // --- Pack data into buffer ---
-        byte data[bufferSize];
-        memcpy(data,      &accX,     sizeof(accX));
-        memcpy(data + 2,  &accY,     sizeof(accY));
-        memcpy(data + 4,  &accZ,     sizeof(accZ));
-        memcpy(data + 6,  &temp_int, sizeof(temp_int));
-        memcpy(data + 8,  &hum_int,  sizeof(hum_int));
-        memcpy(data +10,  &bvoc_int, sizeof(bvoc_int));
-        memcpy(data +12,  &iaq_int,  sizeof(iaq_int));
-
-        // --- Send data via BLE ---
-        sensorCharacteristic.writeValue(data, sizeof(data));
+            samples += EI_CLASSIFIER_RAW_SAMPLES_PER_FRAME;
+          }
+        }
       }
+
+      // --- Inferencia ---
+      signal_t signal;
+      if (numpy::signal_from_buffer(buffer, EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE, &signal) != 0) continue;
+
+      ei_impulse_result_t result = { 0 };
+      EI_IMPULSE_ERROR res = run_classifier(&signal, &result, false);
+      if (res != EI_IMPULSE_OK) continue;
+
+      float anomaly_f = result.anomaly;           
+      int32_t anomaly_int = (int32_t)(anomaly_f * 1000.0f);
+
+      // --- Calcular RMS por eje ---
+      float sumX = 0.0f, sumY = 0.0f, sumZ = 0.0f;
+      int numSamples = EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE / EI_CLASSIFIER_RAW_SAMPLES_PER_FRAME;
+      for (int i = 0; i < numSamples; i++) {
+        float x = buffer[i * 3 + 0];
+        float y = buffer[i * 3 + 1];
+        float z = buffer[i * 3 + 2];
+        sumX += x * x;
+        sumY += y * y;
+        sumZ += z * z;
+      }
+      float rmsX = sqrt(sumX / numSamples);
+      float rmsY = sqrt(sumY / numSamples);
+      float rmsZ = sqrt(sumZ / numSamples);
+
+      int16_t rmsX_int = (int16_t)rmsX;
+      int16_t rmsY_int = (int16_t)rmsY;
+      int16_t rmsZ_int = (int16_t)rmsZ;
+
+      // --- Leer sensores ---
+      float temperature = bsec.comp_t() + temp_correction;
+      float humidity    = bsec.comp_h() + humidity_correction;
+      float bvoc        = bsec.b_voc_eq();  
+      float iaq         = bsec.iaq();       
+
+      int16_t temp_int = (int16_t)(temperature * 100);
+      int16_t hum_int  = (int16_t)(humidity * 100);
+      int16_t bvoc_int = (int16_t)(bvoc * 100);
+      int16_t iaq_int  = (int16_t)(iaq * 10);
+
+      // --- Crear paquete ---
+      Packet pkt;
+      pkt.sampleTime = sampleTime_ms;
+      pkt.accXRMS = rmsX_int;
+      pkt.accYRMS = rmsY_int;
+      pkt.accZRMS = rmsZ_int;
+      pkt.temp = temp_int;
+      pkt.hum = hum_int;
+      pkt.bvoc = bvoc_int;
+      pkt.iaq = iaq_int;
+      pkt.anomaly = anomaly_int;
+
+      // --- Debug Serial ---
+      Serial.print(DEVICE_ID); Serial.print(", ");
+      Serial.print(pkt.sampleTime); Serial.print(", ");
+      Serial.print(pkt.accXRMS); Serial.print(", ");
+      Serial.print(pkt.accYRMS); Serial.print(", ");
+      Serial.print(pkt.accZRMS); Serial.print(", ");
+      Serial.print(pkt.temp); Serial.print(", ");
+      Serial.print(pkt.hum); Serial.print(", ");
+      Serial.print(pkt.bvoc); Serial.print(", ");
+      Serial.print(pkt.iaq); Serial.print(", ");
+      Serial.println(pkt.anomaly);
+
+      // --- Enviar por BLE ---
+      sensorCharacteristic.writeValue((uint8_t*)&pkt, sizeof(pkt));
     }
-    Serial.println("Disconnected from central device!");
+
+    Serial.println("Central disconnected");
   }
-  delay(100);
 }
